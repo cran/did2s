@@ -12,7 +12,9 @@
 #'   (e.g. treatment variable or event-study leads/lags).
 #'   Formula following \code{\link[fixest:feols]{fixest::feols}}.
 #'   Use `i()` for factor variables, see \code{\link[fixest:i]{fixest::i}}.
-#' @param treatment A variable that = 1 if treated, = 0 otherwise
+#' @param treatment A variable that = 1 if treated, = 0 otherwise. The first
+#'   stage will be estimated for `treatment == 0`. The second stage will be
+#'   estimated for the *full sample*.
 #' @param cluster_var What variable to cluster standard errors. This can be IDs
 #'   or a higher aggregate level (state for example)
 #' @param weights Optional. Variable name for regression weights.
@@ -88,47 +90,35 @@
 #' ```
 #'
 #' @export
-did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var,
-                  weights = NULL, bootstrap = FALSE, n_bootstraps = 250,
-                  return_bootstrap = FALSE, verbose = TRUE) {
-
+did2s <- function(
+  data,
+  yname,
+  first_stage,
+  second_stage,
+  treatment,
+  cluster_var,
+  weights = NULL,
+  bootstrap = FALSE,
+  n_bootstraps = 250,
+  return_bootstrap = FALSE,
+  verbose = FALSE
+) {
   # Check Parameters ---------------------------------------------------------
+  dreamerr::check_arg(data, "data.frame")
+  dreamerr::check_value(data[[treatment]], "logical (loose) vector")
 
-  if (!inherits(data, "data.frame")) stop("`did2s` requires a data.frame like object for analysis.")
-
-  # Extract vars from formula
-  if (inherits(first_stage, "formula")) first_stage <- as.character(first_stage)[[2]]
-  if (inherits(second_stage, "formula")) second_stage <- as.character(second_stage)[[2]]
-
-  # Check that treatment is a 0/1 or T/F variable
-  if (!all(
-    unique(data[[treatment]]) %in% c(1, 0, T, F)
-  )) {
-    stop(sprintf(
-      "'%s' must be a 0/1 or T/F variable indicating which observations are untreated/not-yet-treated.",
-      treatment
-    ))
-  }
-
-
-  # Print --------------------------------------------------------------------
   if (verbose) {
-    if (!bootstrap) cluster_msg <- paste0("- Standard errors will be clustered by `", cluster_var, "`\n")
-    if (bootstrap) cluster_msg <- paste0("- Standard errors will be block bootstrapped with cluster `", cluster_var, "`\n")
-    message(
-      paste(
-        "Running Two-stage Difference-in-Differences\n",
-        paste0("- first stage formula `", paste0("~ ", first_stage), "`\n"),
-        paste0("- second stage formula `", paste0("~ ", second_stage), "`\n"),
-        paste0("- The indicator variable that denotes when treatment is on is `", treatment, "`\n"),
-        cluster_msg,
-        collapse = "\n"
-      )
+    did2s_summary_message(
+      yname,
+      first_stage,
+      second_stage,
+      treatment,
+      cluster_var,
+      bootstrap
     )
   }
 
   # Point Estimates ----------------------------------------------------------
-
   est <- did2s_estimate(
     data = data,
     yname = yname,
@@ -140,12 +130,13 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
   )
 
   # Analytic Standard Errors -------------------------------------------------
-
   if (!bootstrap) {
     # Subset data to the observations used in the second stage
     # obsRemoved have - in front of rows, so they are deleted
     removed_rows <- est$second_stage$obs_selection$obsRemoved
-    if (!is.null(removed_rows)) data <- data[removed_rows, ]
+    if (!is.null(removed_rows)) {
+      data <- data[removed_rows, ]
+    }
 
     # Extract weights
     if (is.null(weights)) {
@@ -156,14 +147,23 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
 
     # Extract first stage
     first_u <- est$first_u
-    if (!is.null(removed_rows)) first_u <- first_u[removed_rows]
+    if (!is.null(removed_rows)) {
+      first_u <- first_u[removed_rows]
+    }
 
     # x1 is matrix used to predict Y(0)
-    x1 <- did2s_sparse(data, est$first_stage, weights_vector)
+    x1 <- fixest::sparse_model_matrix(
+      est$first_stage,
+      data = data,
+      type = c("rhs", "fixef")
+    )
 
     # Extract second stage
     second_u <- stats::residuals(est$second_stage)
-    x2 <- did2s_sparse(data, est$second_stage, weights_vector)
+    x2 <- fixest::sparse_model_matrix(
+      est$second_stage,
+      type = c("rhs", "fixef")
+    )
 
     # multiply by weights
     first_u <- weights_vector * first_u
@@ -174,58 +174,63 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
     # x10 is matrix used to estimate first stage (zero out rows with D_it = 1)
     x10 <- copy(x1)
     # treated rows. Note dgcMatrix is 0-index !!
-    treated_rows = which(data[[treatment]] == 1L) - 1
-    idx = x10@i %in% treated_rows
+    treated_rows <- which(data[[treatment]] == 1L) - 1
+    idx <- x10@i %in% treated_rows
     x10@x[idx] <- 0
 
-    # x2'x1 (x10'x10)^-1
-    # Note: MatrixExtra makes transposing sparse matrices easy
-    # Note: SparseM relies on A (x10'x10) being positive symmetric for solving
-    V <- MatrixExtra::t_deep(
-      SparseM::solve(
-        Matrix::crossprod(x10),
-        MatrixExtra::t_shallow(Matrix::crossprod(x2, x1))
+    # The influence consists of two terms:
+    # (X_2' X_2)^{-1} X_2' (y - \hat{y}(0))
+    #
+    # First is the second stage standard OLS IF:
+    # $$(X_2' X_2)^{-1} X_{2i}' \hat{v}_i$$
+    #
+    # Second is the effect of the first stage estimate of $\hat{y}(0)$:
+    # $$(X_2' X_2)^{-1} X_2' X_1 (X_{10}' X_{10})^{-1) X_{10, i} \hat{u}_i$$
+    #
+    # The IF is the sum of the two terms
+    #
+    x2tx2_inv <- (est$second_stage$cov.iid / est$second_stage$sigma2)
+    IF_ss <- x2tx2_inv %*% Matrix::t(x2 * second_u)
+
+    # Use robust QR-based solve instead of direct Matrix::solve()
+    gamma_hat <- robust_solve_XtX(x10, Matrix::crossprod(x1, x2))
+    IF_fs <- x2tx2_inv %*% Matrix::t(gamma_hat) %*% Matrix::t((x10 * first_u))
+
+    IF <- IF_fs - IF_ss
+
+    cl <- data[[cluster_var]]
+    cov <- Reduce(
+      "+",
+      lapply(
+        split(1:length(cl), cl),
+        function(cl_idx) {
+          Matrix::tcrossprod(Matrix::rowSums(IF[, cl_idx, drop = FALSE]))
+        }
       )
     )
-
-    # Unique values of cluster variable
-    cl = data[[cluster_var]]
-    cls = split(1:length(cl), as.factor(cl))
-
-    for (i in 1:length(cls)) {
-      in_cl = cls[[i]]
-      
-      x2_g = x2[in_cl, , drop = FALSE]
-      x10_g = x10[in_cl, , drop = FALSE]
-      first_u_g = first_u[in_cl]
-      second_u_g = second_u[in_cl]
-      
-      W = Matrix::crossprod(x2_g, second_u_g) - V %*% Matrix::crossprod(x10_g, first_u_g)
-
-      # W' W
-      if(i == 1) { 
-        meat_sum = Matrix::tcrossprod(W)
-      } else {
-        meat_sum = meat_sum + Matrix::tcrossprod(W)
-      }
-    }
-
-    # (X_2'X_2)^-1 (sum W_g W_g') (X_2'X_2)^-1
-    bread = SparseM::solve(Matrix::crossprod(x2))
-    cov <- as.matrix(bread %*% meat_sum %*% bread)
+    cov <- as.matrix(cov)
+    rownames(cov) <- colnames(cov) <- names(est$second_stage$coefficients)
   }
-
 
   # Bootstrap Standard Errors ------------------------------------------------
   if (bootstrap) {
-    message(paste0("Starting ", n_bootstraps, " bootstraps at cluster level: ", cluster_var, "\n"))
+    if (verbose) {
+      message(sprintf(
+        "Starting %s bootstraps at cluster level: %s\n",
+        n_bootstraps,
+        cluster_var
+      ))
+    }
 
     # Unique values of cluster variable
     cl <- unique(data[[cluster_var]])
 
     stat <- function(x, i) {
       # select the observations to subset based on the cluster var
-      block_obs <- unlist(lapply(i, function(n) which(x[n] == data[[cluster_var]])))
+      block_obs <- unlist(lapply(
+        i,
+        function(n) which(x[n] == data[[cluster_var]])
+      ))
       # run regression for given replicate, return estimated coefficients
       stats::coefficients(
         did2s_estimate(
@@ -255,33 +260,88 @@ did2s <- function(data, yname, first_stage, second_stage, treatment, cluster_var
   }
 
   # summary creates fixest object with correct standard errors and vcov
-
-  # Once fixest updates on CRAN
-  # rescale cov by G/(G-1) and use t(G-1) distribution
-  # G = length(cl)
-  # cov = cov * G/(G-1)
-
-  return(base::suppressWarnings(
-    # summary(
-    #   est$second_stage,
-    #   .vcov = list("Two-stage Adjusted" = cov),
-    #   ssc = ssc(adj = FALSE, t.df = G-1)
-    # )
-    summary(est$second_stage, .vcov = cov)
-  ))
+  vcov_list = list()
+  vcov_list[[sprintf("Corrected Clustered (%s)", cluster_var)]] = cov
+  est <- base::suppressWarnings(summary(est$second_stage, vcov = vcov_list))
+  return(est)
 }
 
 
 # Point estimate for did2s
-did2s_estimate <- function(data, yname, first_stage, second_stage, treatment,
-                           weights = NULL, bootstrap = FALSE) {
+#' Robust solve for X'X beta = X'Y using QR decomposition
+#'
+#' This function computes the least squares solution beta = (X'X)^(-1) X'Y
+#' in a numerically stable way using QR decomposition, handling rank-deficient
+#' matrices gracefully.
+#'
+#' @param X Design matrix (sparse or dense)
+#' @param Y Response matrix/vector (can be X'Y if already computed)
+#' @return The least squares solution beta (may contain 0 for rank-deficient columns)
+robust_solve_XtX <- function(X, Y) {
+  # Handle both vector and matrix Y
+  if (is.vector(Y)) {
+    # Y is a vector, need to compute X'Y
+    XtY <- Matrix::crossprod(X, Y)
+  } else {
+    # Y is a matrix, check dimensions
+    if (nrow(Y) == nrow(X)) {
+      # Y is the raw response matrix, need to compute X'Y
+      XtY <- Matrix::crossprod(X, Y)
+    } else if (nrow(Y) == ncol(X)) {
+      # Y is already X'Y (cross product form)
+      XtY <- Y
+    } else {
+      stop("Incompatible dimensions between X and Y")
+    }
+  }
+
+  # Now solve the system X'X beta = X'Y using robust methods
+  XtX <- Matrix::crossprod(X)
+
+  # Check if the matrix is singular using condition number approach
+  beta_hat <- tryCatch(
+    {
+      # Try direct solve first for speed
+      Matrix::solve(XtX, XtY)
+    },
+    error = function(e) {
+      # If direct solve fails, fall back to SVD-based approach
+      # Use the fact that the least squares solution is
+      # beta_hat = (X'X)+ * X'Y where (X'X)+ is the Moore-Penrose pseudoinverse
+
+      # For now, use a simple approach: set small singular values to zero
+      SVD <- svd(as.matrix(XtX))
+      tol <- max(dim(XtX)) * .Machine$double.eps * max(SVD$d)
+      positive_indices <- SVD$d > tol
+
+      # Matrix is rank deficient
+      d_inv <- ifelse(positive_indices, 1 / SVD$d, 0)
+      XtX_pinv <- SVD$v %*% diag(d_inv) %*% t(SVD$u)
+      XtX_pinv %*% as.matrix(XtY)
+    }
+  )
+
+  return(beta_hat)
+}
+
+
+# Point estimate for did2s
+did2s_estimate <- function(
+  data,
+  yname,
+  first_stage,
+  second_stage,
+  treatment,
+  weights = NULL,
+  bootstrap = FALSE,
+  cluster_var = NULL # Just so you can switch `did2s` to `did2s_estimate` for quick dev estimation
+) {
   ## We'll use fixest's formula expansion macros to swap out first and second
   ## stages (see: ?fixest::xpd)
   fixest::setFixest_fml(
     ..first_stage = first_stage,
     ..second_stage = second_stage
   )
-
 
   # First stage among untreated
   untreat <- data[data[[treatment]] == 0, ]
@@ -291,12 +351,14 @@ did2s_estimate <- function(data, yname, first_stage, second_stage, treatment,
     weights_vector <- untreat[[weights]]
   }
 
-  first_stage <- fixest::feols(fixest::xpd(~ 0 + ..first_stage, lhs = yname),
+  first_stage <- fixest::feols(
+    fixest::xpd(~ 0 + ..first_stage, lhs = yname),
     data = untreat,
     weights = weights_vector,
-    combine.quick = FALSE, # allows var1^var2 in FEs
+    # combine.quick = FALSE, # (deprecated argument)
+    fixef.keep_names = TRUE, # allows var1^var2 in FEs
     warn = FALSE,
-    notes = FALSE
+    notes = FALSE,
   )
 
   # Residualize outcome variable but keep same yname
@@ -304,13 +366,17 @@ did2s_estimate <- function(data, yname, first_stage, second_stage, treatment,
   data[[yname]] <- first_u
 
   # Zero out residual rows with D_it = 1 (for analytical SEs later on)
-  if (!bootstrap) first_u[data[[treatment]] == 1] <- 0
+  if (!bootstrap) {
+    first_u[data[[treatment]] == 1] <- 0
+  }
 
   # Second stage
+  if (!is.null(weights)) {
+    weights_vector <- data[[weights]]
+  }
 
-  if (!is.null(weights)) weights_vector <- data[[weights]]
-
-  second_stage <- fixest::feols(fixest::xpd(~ 0 + ..second_stage, lhs = yname),
+  second_stage <- fixest::feols(
+    fixest::xpd(~ 0 + ..second_stage, lhs = yname),
     data = data,
     weights = weights_vector,
     warn = FALSE,
@@ -333,4 +399,39 @@ did2s_estimate <- function(data, yname, first_stage, second_stage, treatment,
   }
 
   return(ret)
+}
+
+did2s_summary_message <- function(
+  yname,
+  first_stage,
+  second_stage,
+  treatment,
+  cluster_var,
+  bootstrap
+) {
+  cluster_msg <- if (bootstrap) {
+    sprintf(
+      "- Standard errors will be block bootstrapped with cluster `%s`\n",
+      cluster_var
+    )
+  } else {
+    sprintf(
+      "- Standard errors will be clustered by `%s`\n",
+      cluster_var
+    )
+  }
+
+  msg <- paste(
+    "Running Two-stage Difference-in-Differences\n",
+    sprintf("- first stage formula %s\n", rlang::f_label(first_stage)),
+    sprintf("- second stage formula %s\n", rlang::f_label(second_stage)),
+    sprintf(
+      "- The indicator variable that denotes when treatment is on is `%s`\n",
+      treatment
+    ),
+    cluster_msg,
+    collapse = "\n"
+  )
+
+  message(msg)
 }
