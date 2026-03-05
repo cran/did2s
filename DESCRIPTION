@@ -1,6 +1,6 @@
 Package: did2s
 Title: Two-Stage Difference-in-Differences Following Gardner (2021)
-Version: 1.2.0
+Version: 1.2.1
 Authors@R: 
     c(person(given = "Kyle",
              family = "Butts",
@@ -34,11 +34,11 @@ Suggests: haven, knitr, rmarkdown, testthat (>= 3.0.0)
 VignetteBuilder: knitr
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2025-09-18 13:17:16 UTC; kbutts
+Packaged: 2026-03-05 00:23:39 UTC; kbutts
 Author: Kyle Butts [aut, cre] (ORCID: <https://orcid.org/0000-0002-9048-8059>),
   John Gardner [aut] (ORCID: <https://orcid.org/0000-0002-4028-6862>),
   Grant McDermott [ctb] (ORCID: <https://orcid.org/0000-0001-7883-8573>),
   Laurent Berge [ctb]
 Maintainer: Kyle Butts <buttskyle96@gmail.com>
 Repository: CRAN
-Date/Publication: 2025-09-19 07:10:10 UTC
+Date/Publication: 2026-03-05 00:40:02 UTC

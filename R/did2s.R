@@ -77,15 +77,16 @@
 #' Here's an example using data from Cheng and Hoekstra (2013)
 #' ```{r, comment = "#>", collapse = TRUE}
 #' # Castle Data
-#' castle <- haven::read_dta("https://github.com/scunning1975/mixtape/raw/master/castle.dta")
+#' data(castle, package = "did2s")
 #'
 #' did2s(
 #' 	data = castle,
 #' 	yname = "l_homicide",
-#' 	first_stage = ~ 0 | sid + year,
+#' 	first_stage = ~ 0 | state + year,
 #' 	second_stage = ~ i(post, ref=0),
 #' 	treatment = "post",
-#' 	cluster_var = "state", weights = "popwt"
+#' 	cluster_var = "state",
+#'  weights = "popwt"
 #' )
 #' ```
 #'
@@ -199,6 +200,7 @@ did2s <- function(
     IF <- IF_fs - IF_ss
 
     cl <- data[[cluster_var]]
+
     cov <- Reduce(
       "+",
       lapply(
@@ -357,6 +359,7 @@ did2s_estimate <- function(
     weights = weights_vector,
     # combine.quick = FALSE, # (deprecated argument)
     fixef.keep_names = TRUE, # allows var1^var2 in FEs
+    fixef.rm = "none",
     warn = FALSE,
     notes = FALSE,
   )

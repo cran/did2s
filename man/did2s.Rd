@@ -169,15 +169,16 @@ fixest::coefplot(es, keep = "rel_year::(.*)")
 Here's an example using data from Cheng and Hoekstra (2013)
 
 \if{html}{\out{<div class="sourceCode r">}}\preformatted{# Castle Data
-castle <- haven::read_dta("https://github.com/scunning1975/mixtape/raw/master/castle.dta")
+data(castle, package = "did2s")
 
 did2s(
 	data = castle,
 	yname = "l_homicide",
-	first_stage = ~ 0 | sid + year,
+	first_stage = ~ 0 | state + year,
 	second_stage = ~ i(post, ref=0),
 	treatment = "post",
-	cluster_var = "state", weights = "popwt"
+	cluster_var = "state",
+ weights = "popwt"
 )
 #> OLS estimation, Dep. Var.: l_homicide
 #> Observations: 550
